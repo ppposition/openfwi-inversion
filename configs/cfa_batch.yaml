@@ -1,0 +1,54 @@
+mode: diffusion
+dataset: curve_fault_a_batch
+
+datasets:
+  curve_fault_a_batch:
+    train_dir: ../../model_testdata/test_data/cfA
+    model_path: ../../model_testdata/model/CurveFault-A
+    samples:
+      - name: ex9
+        file: ../../model_testdata/test_data/cfA/vel4_1_33_9.npy
+        index: null
+      - name: ex19
+        file: ../../model_testdata/test_data/cfA/vel4_1_33_19.npy
+        index: null
+
+data:
+  scale: 1500.0
+  offset: -2.0
+
+runtime:
+  device: cuda:0
+  cuda_visible_devices: null
+  seed: 2
+  output_dir: ../outputs/cfa_batch_test
+
+acquisition:
+  model_size: 70
+  shots: 10
+  source_side: up
+  receiver_side: up
+  dx: 10.0
+  dt: 0.001
+  nt: 1000
+  frequency: 15.0
+  accuracy: 8
+  pml_width: [6, 6, 6, 6]
+
+diffusion:
+  image_size: 72
+  timesteps: 1000
+  rho: 1.8
+  grad_decay: 1.0
+  warmup_steps: 0
+  loss: w2
+  lambda_range: 0.0
+  lambda_tv: 0.0
+  weight_k: 100.0
+  rms_threshold: 0.01
+  agc_window_size: 10
+  rate_down: 0.0001
+  rate_power: 0.45
+  observation_noise_std: 0.05
+  plot_x0_steps: false
+

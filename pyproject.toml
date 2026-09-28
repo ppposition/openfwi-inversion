@@ -1,0 +1,29 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "openfwi-inversion"
+version = "0.1.0"
+description = "YAML-driven diffusion training and waveform inversion for OpenFWI velocity models"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+  "accelerate>=0.34",
+  "deepwave>=0.0.23",
+  "diffusers>=0.30",
+  "huggingface-hub>=0.26",
+  "matplotlib>=3.8",
+  "numpy>=1.26",
+  "pyyaml>=6.0",
+  "tensorboard>=2.18",
+  "torch>=2.2",
+  "tqdm>=4.66",
+]
+
+[project.scripts]
+openfwi = "openfwi_inversion.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+

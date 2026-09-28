@@ -1,0 +1,114 @@
+# Choose one workflow: diffusion, optimization, or train.
+mode: diffusion
+
+# Select one key from `datasets`. Add new datasets with the same three fields.
+dataset: flat_fault_b
+datasets:
+  flat_fault_a:
+    train_dir: ../data/FlatFault_A
+    sample_file: ../data/FlatFault_A/model1.npy
+    sample_index: 0
+    model_path: ../models/FlatFault-A
+  flat_fault_b:
+    train_dir: ../data/FlatFault_B
+    sample_file: ../data/FlatFault_B/model1.npy
+    sample_index: 0
+    model_path: ../models/FlatFault-B
+  curve_fault_a:
+    train_dir: ../data/CurveFault_A
+    sample_file: ../data/CurveFault_A/model1.npy
+    sample_index: 0
+    model_path: ../models/CurveFault-A
+  curve_fault_b:
+    train_dir: ../data/CurveFault_B
+    sample_file: ../data/CurveFault_B/model1.npy
+    sample_index: 0
+    model_path: ../models/CurveFault-B
+  curve_vel_a:
+    train_dir: ../data/CurveVel_A
+    sample_file: ../data/CurveVel_A/model1.npy
+    sample_index: 0
+    model_path: ../models/CurveVel-A
+  curve_vel_b:
+    train_dir: ../data/CurveVel_B
+    sample_file: ../data/CurveVel_B/model1.npy
+    sample_index: 0
+    model_path: ../models/CurveVel-B
+
+data:
+  scale: 1500.0
+  offset: -2.0
+
+runtime:
+  device: cuda:0
+  cuda_visible_devices: null
+  seed: 10
+  output_dir: ../outputs
+
+acquisition:
+  model_size: 70
+  shots: 10
+  source_side: up
+  receiver_side: up
+  dx: 10.0
+  dt: 0.001
+  nt: 1000
+  frequency: 15.0
+  accuracy: 8
+  pml_width: [6, 6, 6, 6]
+
+diffusion:
+  image_size: 72
+  timesteps: 1000
+  rho: 1.45
+  grad_decay: 1.0
+  warmup_steps: 0
+  loss: w2
+  lambda_range: 0.0
+  lambda_tv: 0.0
+  weight_k: 100.0
+  rms_threshold: 0.01
+  agc_window_size: 10
+  rate_down: 0.0001
+  rate_power: 0.45
+  observation_noise_std: 0.05
+  plot_x0_steps: false
+
+optimization:
+  image_size: 70
+  steps: 10000
+  learning_rate: 1.3
+  optimizer: gd
+  loss: w2
+  lambda_range: 0.0
+  lambda_tv: 0.1
+  observation_noise_std: 0.05
+  weight_k: 100.0
+  use_weighting: true
+  rate_down: 0.0001
+  rate_power: 0.65
+
+train:
+  # Restrict this pattern if the download directory also contains seismic data files.
+  file_glob: "**/model*.npy"
+  image_size: 72
+  batch_size: 64
+  eval_batch_size: 16
+  epochs: 500
+  learning_rate: 0.0001
+  timesteps: 1000
+  eval_steps: 1000
+  eval_eta: 0.0
+  prediction_type: v_prediction
+  gradient_accumulation_steps: 1
+  lr_warmup_steps: 500
+  mixed_precision: "no"
+  num_workers: 4
+  num_processes: 1
+  save_image_epochs: 20
+  save_model_epochs: 20
+  base_model: null
+  resume_dir: null
+  push_to_hub: false
+  hub_model_id: null
+  hub_private_repo: null
