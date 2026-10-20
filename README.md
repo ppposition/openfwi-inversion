@@ -3,7 +3,6 @@
 A YAML-driven project for training an unconditional diffusion prior and running two waveform-inversion workflows on OpenFWI velocity models:
 
 - `diffusion`: diffusion sampling guided by a Deepwave data-misfit gradient;
-- `optimization`: direct gradient descent (GD) inversion of a velocity model;
 - `train`: DDPM training on NumPy velocity models.
 
 Dataset choice and experiment values are centralized in one YAML file. Each invocation runs one configuration; there are no nested parameter-sweep loops in the entry points.
