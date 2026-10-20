@@ -45,12 +45,11 @@ def run(config: dict) -> None:
     expected_shape = (int(acquisition["model_size"]),) * 2
     if tuple(x_true.shape) != expected_shape:
         raise ValueError(f"Expected sample shape {expected_shape}, got {tuple(x_true.shape)}")
-    latents, errors, losses = core.optimize_with_adam(
+    latents, errors, losses = core.optimize_with_gd(
         image_size=int(section["image_size"]),
         x_true=x_true,
         steps=int(section["steps"]),
         lr=float(section["learning_rate"]),
-        lam_range=float(section["lambda_range"]),
         lam_tv=float(section["lambda_tv"]),
         sigma=float(section["observation_noise_std"]),
         shot_num=int(acquisition["shots"]),
@@ -58,7 +57,6 @@ def run(config: dict) -> None:
         receiver_locations=acquisition["receiver_side"],
         k=float(section["weight_k"]),
         use_weighted=bool(section["use_weighting"]),
-        optimizer_name=section["optimizer"],
         rate_down=float(section["rate_down"]),
         rate_power=float(section["rate_power"]),
     )

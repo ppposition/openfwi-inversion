@@ -7,6 +7,7 @@ import os
 from pathlib import Path
 
 import torch
+from accelerate import notebook_launcher
 from diffusers import DDPMPipeline, DDPMScheduler, UNet2DModel
 from diffusers.optimization import get_cosine_schedule_with_warmup
 from torch.utils.data import DataLoader
@@ -36,7 +37,7 @@ def run(config: dict) -> None:
     data_dir = resolve_path(config, require(dataset_config, "train_dir", "datasets.<selected>"))
     output_dir = resolve_path(config, runtime.get("output_dir", "outputs")) / config["dataset"] / "train"
     snapshot_config(config, output_dir)
-    file_glob = section.get("file_glob", "**/*.npy")
+    file_glob = section.get("file_glob", "**/model*.npy")
     files = [Path(path) for path in sorted(glob.glob(os.path.join(data_dir, file_glob), recursive=True))]
     if not files:
         raise FileNotFoundError(f"No .npy files found under {data_dir}")
@@ -58,12 +59,8 @@ def run(config: dict) -> None:
         seed=int(runtime.get("seed", 42)),
         timesteps=int(section["timesteps"]),
         num_workers=int(section["num_workers"]),
-        data_dir=str(data_dir),
         num_processes=int(section["num_processes"]),
         prediction_type=section["prediction_type"],
-        push_to_hub=bool(section.get("push_to_hub", False)),
-        hub_model_id=section.get("hub_model_id"),
-        hub_private_repo=section.get("hub_private_repo"),
     )
     dataset = NpyVelocityDataset(
         files,
@@ -113,7 +110,7 @@ def run(config: dict) -> None:
         scheduler.load_state_dict(state["lr_scheduler"])
         train_config.start_epoch = int(state.get("epoch", 0))
         train_config.start_step = int(state.get("global_step", 0))
-    core.notebook_launcher(
+    notebook_launcher(
         core.train_loop,
         (train_config, model, noise_scheduler, optimizer, loader, scheduler),
         num_processes=train_config.num_processes,

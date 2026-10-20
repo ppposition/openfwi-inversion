@@ -3,10 +3,10 @@
 A YAML-driven project for training an unconditional diffusion prior and running two waveform-inversion workflows on OpenFWI velocity models:
 
 - `diffusion`: diffusion sampling guided by a Deepwave data-misfit gradient;
-- `optimization`: direct Adam, SGD, or L-BFGS optimization of a velocity model;
+- `optimization`: direct gradient descent (GD) inversion of a velocity model;
 - `train`: DDPM training on NumPy velocity models.
 
-The project reorganizes the original `countdown_agc_origin_minimal.py`, `countdown_agc_adam_1.py`, and `train/train_diffusion_npy.py` scripts. Dataset choice and experiment values are centralized in one YAML file. Each invocation runs one configuration; there are no nested parameter-sweep loops in the entry points.
+Dataset choice and experiment values are centralized in one YAML file. Each invocation runs one configuration; there are no nested parameter-sweep loops in the entry points.
 
 ## Project layout
 
@@ -88,7 +88,7 @@ openfwi-inversion/
 └── ...
 ```
 
-The inversion modes require a Diffusers model directory containing `unet/` and `scheduler/`. Train one with this project or point `model_path` to an existing compatible checkpoint.
+Diffusion inversion requires a Diffusers model directory containing `unet/` and `scheduler/`. Train one with this project or point `model_path` to an existing compatible checkpoint.
 
 ### Pretrained diffusion models
 
@@ -144,7 +144,7 @@ datasets:
 
 Add another profile in the same form to use a new dataset; no Python changes are required. `train_dir` is used by training, `sample_file` by inversion, and `model_path` by diffusion inversion or as the default training architecture source. Set `sample_index` for a batched OpenFWI label file, or set it to `null` when `sample_file` already contains one model.
 
-For simultaneous batch inversion, replace `sample_file` with a `samples` list:
+For simultaneous diffusion inversion, replace `sample_file` with a `samples` list:
 
 ```yaml
 datasets:
@@ -161,6 +161,13 @@ datasets:
 ```
 
 The batch size is inferred from this list. The UNet and Deepwave propagation run with a real batch dimension; losses, errors, tensors, and plots are also saved separately for every sample.
+
+To invert one model with several seeds in the same batch, repeat its `file`
+entry with different `name` and `seed` values under `samples`. Each entry then
+uses independent random streams for its initial latent, DDPM steps, and
+observation noise. Entries without `seed` use `runtime.seed` when any entry
+has an explicit seed. Without per-entry seeds, the existing shared batch
+random stream is preserved. Per-entry seeds are saved in `metrics.json`.
 
 The remaining sections control normalization, device and seed, acquisition geometry, and workflow-specific settings. To run several experiments, create several YAML files and launch each explicitly. Lists of parameter values are intentionally not expanded into sweeps.
 
@@ -197,6 +204,6 @@ tensorboard --logdir outputs/<dataset>/train/logs
 - The default acquisition assumes a `70 x 70` velocity model and pads diffusion-training samples to `72 x 72`.
 - `train.file_glob` defaults to `**/model*.npy` so that downloaded seismic-data arrays are not treated as velocity labels. Adjust it to match renamed or preprocessed files.
 - Set `runtime.device` to the desired device, for example `cuda:0` or `cpu`. Full inversion is computationally expensive on CPU.
-- `optimization.optimizer` accepts `adam`, `gd`, or `lbfgs`.
-- `diffusion.loss` accepts `mse`, `cumsum`, or `w2`; the direct optimization workflow currently uses its W2 objective.
+- Direct inversion uses GD with gradient scaling and velocity bounds; set `optimization.learning_rate` to control the step size.
+- `diffusion.loss` accepts `mse` or `w2`; the direct optimization workflow currently uses its W2 objective.
 - Set `train.resume_dir` to an `epoch_XXXX` checkpoint or a parent directory containing epoch checkpoints to resume training.

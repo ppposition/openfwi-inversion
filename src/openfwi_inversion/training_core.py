@@ -2,17 +2,13 @@ import glob
 import math
 import os
 from dataclasses import dataclass
-from pathlib import Path
-from typing import Optional
 
 import numpy as np
 import matplotlib.pyplot as plt
 import torch
 import torch.nn.functional as F
-from accelerate import Accelerator, notebook_launcher
+from accelerate import Accelerator
 from diffusers import DDPMPipeline, DDPMScheduler, DDIMPipeline, DDIMScheduler, UNet2DModel
-from huggingface_hub import create_repo, upload_folder
-from torch.utils.tensorboard import SummaryWriter
 from torch.utils.data import DataLoader
 from tqdm.auto import tqdm
 
@@ -32,17 +28,10 @@ class TrainingConfig:
     save_model_epochs: int = 20
     mixed_precision: str = "no"
     output_dir: str = "outputs"
-    push_to_hub: bool = False
-    hub_model_id: Optional[str] = None
-    hub_private_repo: Optional[bool] = None
-    overwrite_output_dir: bool = True
     seed: int = 42
     timesteps: int = 1000
     num_workers: int = 4
-    data_dir: str = "dataset"
     num_processes: int = 1
-    gpu_ids: Optional[str] = None
-    base_model: Optional[str] = "model/curveFault-A"
     start_epoch: int = 0
     start_step: int = 0
     prediction_type: str = "epsilon"
@@ -115,20 +104,9 @@ def train_loop(
         log_with="tensorboard",
         project_dir=os.path.join(config.output_dir, "logs"),
     )
-    writer: Optional[SummaryWriter] = None
     if accelerator.is_main_process:
-        if config.output_dir is not None:
-            os.makedirs(config.output_dir, exist_ok=True)
-        log_dir = os.path.join(config.output_dir, "logs", "tensorboard")
-        os.makedirs(log_dir, exist_ok=True)
-        writer = SummaryWriter(log_dir=log_dir)
-        if config.push_to_hub:
-            repo_id = create_repo(
-                repo_id=config.hub_model_id or Path(config.output_dir).name,
-                exist_ok=True,
-                private=config.hub_private_repo,
-            ).repo_id
-        accelerator.init_trackers("train_example")
+        os.makedirs(config.output_dir, exist_ok=True)
+        accelerator.init_trackers("train")
 
     model, optimizer, train_dataloader, lr_scheduler = accelerator.prepare(
         model, optimizer, train_dataloader, lr_scheduler
@@ -143,7 +121,7 @@ def train_loop(
         progress_bar = tqdm(total=len(train_dataloader), disable=not accelerator.is_local_main_process)
         progress_bar.set_description(f"Epoch {epoch}")
 
-        for step, batch in enumerate(train_dataloader):
+        for batch in train_dataloader:
             clean_images = batch["images"]
             noise = torch.randn(clean_images.shape, device=clean_images.device)
             batch_size = clean_images.shape[0]
@@ -186,9 +164,6 @@ def train_loop(
             }
             progress_bar.set_postfix(**logs)
             accelerator.log(logs, step=global_step)
-            if writer is not None:
-                writer.add_scalar("train/loss", logs["loss"], global_step)
-                writer.add_scalar("train/lr", logs["lr"], global_step)
             global_step += 1
 
         if accelerator.is_main_process:
@@ -212,19 +187,11 @@ def train_loop(
                     "lr_scheduler": lr_scheduler.state_dict(),
                 }
                 torch.save(trainer_state, os.path.join(epoch_dir, "trainer_state.pt"))
-                if config.push_to_hub:
-                    upload_folder(
-                        repo_id=repo_id,
-                        folder_path=epoch_dir,
-                        commit_message=f"Epoch {epoch + 1}",
-                    )
 
             if was_training:
                 unet.train()
 
-    if writer is not None:
-        writer.flush()
-        writer.close()
+    accelerator.end_training()
 
 
 def _resolve_resume_dir(resume_dir: str) -> str:

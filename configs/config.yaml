@@ -1,7 +1,7 @@
 # Choose one workflow: diffusion, optimization, or train.
 mode: diffusion
 
-# Select one key from `datasets`. Add new datasets with the same three fields.
+# Select one key from `datasets`. Add new datasets using the same fields.
 dataset: flat_fault_b
 datasets:
   flat_fault_a:
@@ -55,32 +55,24 @@ acquisition:
   nt: 1000
   frequency: 15.0
   accuracy: 8
-  pml_width: [6, 6, 6, 6]
+  pml_width: [0, 6, 6, 6]
 
 diffusion:
   image_size: 72
   timesteps: 1000
   rho: 1.45
   grad_decay: 1.0
-  warmup_steps: 0
   loss: w2
-  lambda_range: 0.0
-  lambda_tv: 0.0
   weight_k: 100.0
-  rms_threshold: 0.01
-  agc_window_size: 10
   rate_down: 0.0001
   rate_power: 0.45
   observation_noise_std: 0.05
-  plot_x0_steps: false
 
 optimization:
   image_size: 70
   steps: 10000
   learning_rate: 1.3
-  optimizer: gd
   loss: w2
-  lambda_range: 0.0
   lambda_tv: 0.1
   observation_noise_std: 0.05
   weight_k: 100.0
@@ -109,6 +101,3 @@ train:
   save_model_epochs: 20
   base_model: null
   resume_dir: null
-  push_to_hub: false
-  hub_model_id: null
-  hub_private_repo: null

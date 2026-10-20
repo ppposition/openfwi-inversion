@@ -12,7 +12,6 @@ dependencies = [
   "accelerate>=0.34",
   "deepwave>=0.0.23",
   "diffusers>=0.30",
-  "huggingface-hub>=0.26",
   "matplotlib>=3.8",
   "numpy>=1.26",
   "pyyaml>=6.0",

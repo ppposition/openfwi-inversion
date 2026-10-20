@@ -41,12 +41,6 @@ def clear_cuda_cache():
         torch.cuda.ipc_collect()
 
 
-def range_constraint_loss(x):
-    clamped_x = torch.clamp(x, -1, 1)
-    loss = torch.mean((x - clamped_x) ** 2)
-    return loss
-
-
 def tv_regularization(x):
     if x.dim() == 2:
         tv_h = torch.mean(torch.abs(x[1:, :] - x[:-1, :]))
@@ -58,24 +52,6 @@ def tv_regularization(x):
         raise ValueError(f"Unsupported input dimension: {x.dim()}")
 
     return tv_h + tv_w
-
-# def tv_regularization(x):
-#     if x.dim() == 2:
-#         grad_h = x[1:, :] - x[:-1, :]
-#         grad_w = x[:, 1:] - x[:, :-1]
-#         grad_h = grad_h[:, :-1]
-#         grad_w = grad_w[:-1, :]
-#     elif x.dim() == 3:
-#         grad_h = x[:, 1:, :] - x[:, :-1, :]
-#         grad_w = x[:, :, 1:] - x[:, :, :-1]
-#         grad_h = grad_h[:, :, :-1]
-#         grad_w = grad_w[:, :-1, :]
-#     else:
-#         raise ValueError(f"Unsupported input dimension: {x.dim()}")
-
-#     eps = 1e-12
-#     tv = torch.sqrt(grad_h ** 2 + grad_w ** 2 + eps)
-#     return torch.mean(tv)
 
 def w2_distance_from_discretized_pdf(pdf_values1: torch.Tensor,
                                      pdf_values2: torch.Tensor,
@@ -306,40 +282,11 @@ def save_latents_pt(x, path):
     torch.save(x, os.path.join(path, "results.pt"))
 
 
-def save_results_to_file(
-    error,
-    loss,
-    lr,
-    steps,
-    lam_range,
-    lam_tv,
-    k,
-    use_weighted,
-    optimizer_name,
-    rate_down,
-    rate_power,
-    filename="result.txt",
-):
-    with open(filename, "a") as f:
-        f.write("误差计算方法: W2\n")
-        f.write(f"优化器: {optimizer_name}\n")
-        f.write(f"学习率(lr): {lr}\n")
-        f.write(f"优化步数(steps): {steps}\n")
-        f.write(f"权重参数: lam_range={lam_range}, lam_tv={lam_tv}\n")
-        f.write(f"权重幂次(k): {k}\n")
-        f.write(f"变化率参数: rate_down={rate_down}, rate_power={rate_power}\n")
-        f.write(f"是否使用加权: {use_weighted}\n")
-        f.write(f"最终Error: {error}\n")
-        f.write(f"最终Loss: {loss}\n")
-        f.write("-" * 50 + "\n")
-
-
-def optimize_with_adam(
+def optimize_with_gd(
     image_size,
     x_true,
     steps=1000,
     lr=1e-2,
-    lam_range=0.0,
     lam_tv=0.0,
     sigma=0.0,
     shot_num=10,
@@ -347,7 +294,6 @@ def optimize_with_adam(
     receiver_locations="up",
     k=100,
     use_weighted=True,
-    optimizer_name="adam",
     rate_down=1.0,
     rate_power=1.0,
 ):
@@ -355,16 +301,6 @@ def optimize_with_adam(
 
     latents = torch.zeros((1, 1, image_size, image_size), device=device, dtype=x_true.dtype)
     latents.requires_grad_(True)
-
-    optimizer_name = optimizer_name.lower()
-    if optimizer_name == "adam":
-        optimizer = torch.optim.Adam([latents], lr=lr)
-    elif optimizer_name == "lbfgs":
-        optimizer = torch.optim.LBFGS([latents], lr=lr, max_iter=20, line_search_fn="strong_wolfe")
-    elif optimizer_name == "gd":
-        optimizer = torch.optim.SGD([latents], lr=lr)
-    else:
-        raise ValueError("optimizer_name must be 'adam', 'lbfgs', or 'gd'")
 
     with torch.no_grad():
         wave_true_init, _, _ = receiver(
@@ -381,9 +317,8 @@ def optimize_with_adam(
         )
 
     if use_weighted:
-        rms_values = wave_true
-        rms_max = torch.max(abs(wave_true))
-        weights = 1 / (k * abs(rms_values) / rms_max + 1)
+        amplitude_max = torch.max(abs(wave_true))
+        weights = 1 / (k * abs(wave_true) / amplitude_max + 1)
         wave_true = wave_true * weights
     else:
         weights = None
@@ -432,34 +367,19 @@ def optimize_with_adam(
         )
         total_loss_local = base_loss_local / (base_loss_normalizer + 1e-9)
 
-        range_loss_local = range_constraint_loss(x0_pred_local)
         tv_loss_local = tv_regularization(x0_pred_local)
 
-        return total_loss_local + lam_range * range_loss_local + lam_tv * tv_loss_local
+        return total_loss_local + lam_tv * tv_loss_local
 
     for step in range(steps):
-        if optimizer_name == "lbfgs":
-            def closure():
-                optimizer.zero_grad()
-                x0_pred_closure = latents.squeeze()
-                loss_closure = compute_loss(x0_pred_closure)
-                loss_closure.backward()
-                apply_change_rate()
-                return loss_closure
-
-            optimizer.step(closure)
-            clamp_latents()
-            with torch.no_grad():
-                x0_pred = latents.squeeze()
-                loss = compute_loss(x0_pred)
-        else:
-            optimizer.zero_grad()
-            x0_pred = latents.squeeze()
-            loss = compute_loss(x0_pred)
-            loss.backward()
-            apply_change_rate()
-            optimizer.step()
-            clamp_latents()
+        latents.grad = None
+        x0_pred = latents.squeeze()
+        loss = compute_loss(x0_pred)
+        loss.backward()
+        apply_change_rate()
+        with torch.no_grad():
+            latents.add_(latents.grad, alpha=-lr)
+        clamp_latents()
 
         with torch.no_grad():
             error = torch.linalg.norm(x0_pred - x_true) / torch.linalg.norm(x_true - PHYSICS["velocity_offset"])

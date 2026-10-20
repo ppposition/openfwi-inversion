@@ -1,11 +1,11 @@
 import torch
 from tqdm.auto import tqdm
-from diffusers import DDPMScheduler, UNet2DModel
 import os
 import numpy as np
 import matplotlib.pyplot as plt
 import deepwave
 from deepwave import scalar
+from diffusers.utils.torch_utils import randn_tensor
 
 device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 PHYSICS = {
@@ -35,91 +35,6 @@ def configure_physics(acquisition, data):
         velocity_offset=float(data["offset"]),
     )
 
-def cumsum_error(x, y):
-    """计算两个信号积分后的均方误差，仿照W2损失函数添加归一化"""
-    # 获取输入形状
-    original_shape = x.shape
-    
-    # 将输入重塑为二维以便批处理
-    if x.dim() > 1:
-        x_reshaped = x.reshape(-1, x.shape[-1])
-        y_reshaped = y.reshape(-1, y.shape[-1])
-    else:
-        x_reshaped = x.unsqueeze(0)
-        y_reshaped = y.unsqueeze(0)
-    
-    batch_size = x_reshaped.shape[0]
-    n_points = x_reshaped.shape[1]
-    
-    # 计算每个批次的最小值
-    min_vals = torch.min(y_reshaped, dim=-1, keepdim=True)[0]
-    
-    # 确保非负，并减去最小值的1.1倍
-    non_negative_x = x_reshaped - 1.1 * min_vals
-    non_negative_y = y_reshaped - 1.1 * min_vals
-    
-    # 计算积分（使用梯形法则）
-    def _integrate(signal):
-        # signal shape: (batch_size, n_points)
-        # 使用简单梯形法则计算积分
-        integral = torch.sum(signal, dim=-1)
-        return integral
-    
-    '''# 计算每个信号的总积分
-    total_integral_x = _integrate(non_negative_x)
-    total_integral_y = _integrate(non_negative_y)
-    
-    # 归一化，添加小量避免除以零
-    normalized_x = non_negative_x / (total_integral_x.unsqueeze(-1) + 1e-9)
-    normalized_y = non_negative_y / (total_integral_y.unsqueeze(-1) + 1e-9)
-    '''    
-    # 计算累积和
-    int_x = torch.cumsum(non_negative_x, dim=-1)
-    int_y = torch.cumsum(non_negative_y, dim=-1)
-    
-    # 计算均方误差
-    mse = torch.linalg.norm(int_x - int_y)
-    
-    return mse
-
-def range_constraint_loss(x):
-    """
-    计算范围约束损失: L_range = (1/N) * sum((x_i - clamp(x_i, -1, 1))^2)
-    这是一个软约束，鼓励x的值保持在[-1, 1]范围内
-    
-    Args:
-        x (torch.Tensor): 输入张量
-        
-    Returns:
-        torch.Tensor: 范围约束损失
-    """
-    clamped_x = torch.clamp(x, -1, 1)
-    loss = torch.mean((x - clamped_x) ** 2)
-    return loss
-
-def tv_regularization(x):
-    """
-    计算全变分(Total Variation)正则化项
-    TV正则化鼓励图像平滑，减少噪声
-    
-    Args:
-        x (torch.Tensor): 输入张量，形状为 (H, W) 或 (C, H, W)
-        
-    Returns:
-        torch.Tensor: TV正则化损失
-    """
-    if x.dim() == 2:
-        # 2D输入: (H, W)
-        tv_h = torch.mean(torch.abs(x[1:, :] - x[:-1, :]))
-        tv_w = torch.mean(torch.abs(x[:, 1:] - x[:, :-1]))
-    elif x.dim() == 3:
-        # 3D输入: (C, H, W)
-        tv_h = torch.mean(torch.abs(x[:, 1:, :] - x[:, :-1, :]))
-        tv_w = torch.mean(torch.abs(x[:, :, 1:] - x[:, :, :-1]))
-    else:
-        raise ValueError(f"Unsupported input dimension: {x.dim()}")
-    
-    return tv_h + tv_w
 
 def w2_distance_from_discretized_pdf(pdf_values1: torch.Tensor,
                                      pdf_values2: torch.Tensor,
@@ -241,53 +156,6 @@ def w2_distance_from_discretized_pdf(pdf_values1: torch.Tensor,
         output_shape = original_shape[:-1] # (B,) or (B, R)
         return result_flat.view(output_shape)
 
-def agc_gain_control(wavelet, window_size=50, return_rms=False):
-    """
-    自动增益控制(AGC)算法 - 向量化实现
-    对每个道应用滑动窗口的增益控制，使能量均衡
-    
-    Args:
-        wavelet (torch.Tensor): 输入波场数据，形状为 (n_shots, n_receivers, n_timesteps)
-        window_size (int): 滑动窗口大小
-        return_rms (bool): 是否返回RMS值
-        
-    Returns:
-        torch.Tensor: 应用AGC后的波场数据
-        torch.Tensor (可选): RMS值，形状为 (n_shots, n_receivers, n_timesteps)
-    """
-    # 获取输入形状
-    n_shots, n_receivers, n_timesteps = wavelet.shape
-    
-    # 创建输出张量
-    agc_wavelet = torch.zeros_like(wavelet)
-    
-    # 将输入重塑为二维以便批处理 (n_shots*n_receivers, n_timesteps)
-    wavelet_2d = wavelet.reshape(-1, n_timesteps)
-    
-    # 创建一个张量来存储RMS值
-    rms_values = torch.zeros_like(wavelet_2d)
-    # 计算每个时间点的RMS值
-    for t in range(n_timesteps):
-        # 确定窗口范围
-        start = max(0, t - window_size // 2)
-        end = min(n_timesteps, t + window_size // 2)
-        
-        # 计算所有道在当前时间点的窗口内的RMS值
-        window = wavelet_2d[:, start:end]
-        rms = torch.sqrt(torch.mean(window ** 2, dim=1)) + 1e-9  # 添加小量避免除以零
-        rms_values[:, t] = rms
-    
-    # 应用增益控制
-    agc_wavelet_2d = wavelet_2d / rms_values
-    
-    # 恢复原始形状
-    agc_wavelet = agc_wavelet_2d.reshape(n_shots, n_receivers, n_timesteps)
-    rms_values = rms_values.reshape(n_shots, n_receivers, n_timesteps)
-    
-    if return_rms:
-        return agc_wavelet, rms_values
-    else:
-        return agc_wavelet
 
 def _as_model_batch(v):
     """Return velocity models as [batch, height, width]."""
@@ -312,7 +180,7 @@ def _tv_per_sample(x):
     return tv_h + tv_w
 
 
-def receiver(v, device, shot_num, source_locations='up', receiver_locations='up', noise_std=0.05):
+def receiver(v, device, shot_num, source_locations='up', receiver_locations='up', noise_std=0.05, noise_generators=None):
     v = _as_model_batch(v)
     batch_size = v.shape[0]
     v = (v - PHYSICS["velocity_offset"]) * PHYSICS["velocity_scale"]
@@ -410,29 +278,42 @@ def receiver(v, device, shot_num, source_locations='up', receiver_locations='up'
         batch_size, n_shots, n_receivers_per_shot, nt
     )
     if noise_std > 0:
-        receiver_amplitudes = receiver_amplitudes + torch.randn_like(receiver_amplitudes) * noise_std
+        noise = (
+            torch.randn_like(receiver_amplitudes)
+            if noise_generators is None
+            else randn_tensor(
+                receiver_amplitudes.shape, generator=noise_generators,
+                device=receiver_amplitudes.device, dtype=receiver_amplitudes.dtype,
+            )
+        )
+        receiver_amplitudes = receiver_amplitudes + noise * noise_std
     return (
         receiver_amplitudes,
         source_locations.reshape(batch_size, n_shots, n_sources_per_shot, 2),
         receiver_locations.reshape(batch_size, n_shots, n_receivers_per_shot, 2),
     )
 
-def sample(scheduler, unet, npy_size, batch_size=1, rho=0, rate_down=1, rate_power=1, save_x0_steps=False, x_true=None, loss_type='mse', grad_decay=1.0, lam_range=0.1, lam_tv=0.01, shot_num=5, source_locations='up', receiver_locations='up', warmup_steps=0, k=100, rms_threshold=0.01, agc_window_size=50, seed=1, noise_std=0.05):
+def sample(scheduler, unet, npy_size, batch_size=1, rho=0, rate_down=1, rate_power=1, x_true=None, loss_type='mse', grad_decay=1.0, shot_num=5, source_locations='up', receiver_locations='up', k=100, seed=1, noise_std=0.05, sample_seeds=None):
     
     unet.eval()
     for param in unet.parameters():
         param.requires_grad = False
-    generator = torch.Generator(device).manual_seed(seed)
-    latents = torch.randn(
+    if sample_seeds is not None:
+        if len(sample_seeds) != batch_size:
+            raise ValueError("sample_seeds must contain one seed per batch member.")
+        generator = [torch.Generator(device).manual_seed(int(s)) for s in sample_seeds]
+        # Observation noise uses a separate stream from diffusion sampling.
+        noise_generators = [torch.Generator(device).manual_seed(int(s)) for s in sample_seeds]
+    else:
+        generator = torch.Generator(device).manual_seed(seed)
+        noise_generators = None
+    latents = randn_tensor(
         (batch_size, 1, npy_size, npy_size),
         generator=generator,
         device=device,
         dtype=unet.dtype
     )
     
-    if save_x0_steps:
-        x0_predictions = []
-        
     # 初始化用于保存中间过程的列表
     error_history = []
     error_0_history = []
@@ -444,24 +325,12 @@ def sample(scheduler, unet, npy_size, batch_size=1, rho=0, rate_down=1, rate_pow
             raise ValueError(
                 f"x_true batch size {x_true.shape[0]} does not match latent batch size {batch_size}."
             )
-        wave_true, source_locs_true, receiver_locs_true = receiver(x_true, device, shot_num=shot_num, source_locations=source_locations, receiver_locations=receiver_locations, noise_std=noise_std)
-        # 使用AGC算法处理观测数据，并获取RMS值（但不应用AGC）
-        
-        # _, rms_values = agc_gain_control(wave_true, window_size=agc_window_size, return_rms=True)
-        
-        rms_values = wave_true
-        rms_max = torch.amax(abs(wave_true), dim=(1, 2, 3), keepdim=True)
-
-        # 计算权重：(1/rms_values)^weight_power，当rms_values小于阈值时设为1
-        '''weights = torch.ones_like(rms_values)
-        mask = rms_values > rms_threshold
-        weights[mask] = (1.0 / rms_values[mask]) ** weight_power'''
-
-        weights = 1/(k*abs(rms_values)/rms_max+1)
+        wave_true, _, _ = receiver(x_true, device, shot_num=shot_num, source_locations=source_locations, receiver_locations=receiver_locations, noise_std=noise_std, noise_generators=noise_generators)
+        amplitude_max = torch.amax(abs(wave_true), dim=(1, 2, 3), keepdim=True)
+        weights = 1 / (k * abs(wave_true) / amplitude_max + 1)
         wave_true = wave_true * weights
-        
 
-        
+
     progress_bar = tqdm(scheduler.timesteps)
     
     for i, t_step in enumerate(progress_bar):
@@ -474,45 +343,19 @@ def sample(scheduler, unet, npy_size, batch_size=1, rho=0, rate_down=1, rate_pow
         scheduler_output = scheduler.step(noise_pred, t_step, latents, generator=generator)
         latents = scheduler_output.prev_sample
         
-        # 计算当前步长：warm-up阶段线性增长，之后保持定值
-        if warmup_steps > 0 and i < warmup_steps:
-            # warm-up阶段：步长从0线性增长到rho
-            current_rho = rho * (i + 1) / warmup_steps
-        else:
-            # warm-up结束后：保持定值rho
-            current_rho = rho
-        # 尝试使用scheduler返回的pred_original_sample，如果不支持则手动计算
-        if hasattr(scheduler_output, 'pred_original_sample') and scheduler_output.pred_original_sample is not None:
-            # 使用scheduler返回的pred_original_sample作为x_0预测
-            x0_pred = scheduler_output.pred_original_sample
-        else:
-            # 手动计算x_0预测
-            # 根据DDPM的公式: x_0 = (x_t - sqrt(1-alpha_t) * epsilon) / sqrt(alpha_t)
-            # 其中epsilon是噪声预测，alpha_t是当前时间步的alpha值
-            alpha_t = scheduler.alphas_cumprod[t_step]
-            sqrt_alpha_t = torch.sqrt(alpha_t)
-            sqrt_one_minus_alpha_t = torch.sqrt(1.0 - alpha_t)
-
-            x0_pred = (latents - sqrt_one_minus_alpha_t * noise_pred) / sqrt_alpha_t
+        x0_pred = scheduler_output.pred_original_sample
         
         if rho > 0:
             # 根据选择的损失类型计算损失
             x0_models = _crop_model_batch(x0_pred)
-            wave_pred, source_locs_pred, receiver_locs_pred = receiver(x0_models, device, shot_num=shot_num, source_locations=source_locations, receiver_locations=receiver_locations, noise_std=0)
-            # 不对合成波场做AGC，直接将观测波场的权重应用到合成波场
+            wave_pred, _, _ = receiver(x0_models, device, shot_num=shot_num, source_locations=source_locations, receiver_locations=receiver_locations, noise_std=0)
+            # 将观测波场的权重应用到合成波场
             wave_pred = wave_pred * weights
 
-            # 计算基础损失（不再使用 mute 后的波场）
+            # 计算基础损失
             if loss_type == 'mse':
                 base_loss_per_sample = torch.mean(
                     (wave_pred - wave_true) ** 2, dim=(1, 2, 3)
-                )
-            elif loss_type == 'cumsum':
-                min_values = torch.amin(wave_true, dim=-1, keepdim=True)
-                pred_cumsum = torch.cumsum(wave_pred - 1.1 * min_values, dim=-1)
-                true_cumsum = torch.cumsum(wave_true - 1.1 * min_values, dim=-1)
-                base_loss_per_sample = torch.linalg.vector_norm(
-                    (pred_cumsum - true_cumsum).flatten(1), dim=1
                 )
             elif loss_type == 'w2':
                 _, n_shots, n_receivers, n_timesteps = wave_pred.shape
@@ -529,31 +372,16 @@ def sample(scheduler, unet, npy_size, batch_size=1, rho=0, rate_down=1, rate_pow
                     trace_normalizer.mean(dim=(1, 2)) + 1e-9
                 )
             else:
-                raise ValueError("Unsupported loss type. Use 'mse', 'cumsum', or 'w2'.")
+                raise ValueError("Unsupported loss type. Use 'mse' or 'w2'.")
             
-            # 添加范围约束损失
-            clamped_models = torch.clamp(x0_models, -1, 1)
-            range_loss_per_sample = torch.mean(
-                (x0_models - clamped_models) ** 2, dim=(1, 2)
-            )
-            
-            # 添加TV正则化损失
-            tv_loss_per_sample = _tv_per_sample(x0_models)
-            
-            # 总损失 = 基础损失 + 范围约束损失 + TV正则化损失
-            loss_per_sample = (
-                base_loss_per_sample
-                + lam_range * range_loss_per_sample
-                + lam_tv * tv_loss_per_sample
-            )
+            loss_per_sample = base_loss_per_sample
             # Sum rather than mean so each batch member receives the same
             # gradient magnitude as an equivalent single-sample run.
             loss = loss_per_sample.sum()
 
             latents_grad_x0 = torch.autograd.grad(loss, x0_pred, retain_graph=True)[0]
             latents_grad = torch.autograd.grad(loss, latent_model_input)[0]
-            # 使用current_rho而不是rho，以便实现warmup
-            current_rho = current_rho * grad_decay
+            current_rho = rho * grad_decay
             c = 0.1
             gradient_max = torch.amax(
                 abs(latents_grad_x0), dim=(1, 2, 3), keepdim=True
@@ -563,13 +391,11 @@ def sample(scheduler, unet, npy_size, batch_size=1, rho=0, rate_down=1, rate_pow
             ) ** rate_power
 
 
-            tv_damping = torch.exp(-tv_loss_per_sample / c).view(-1, 1, 1, 1)
+            # TV controls the update magnitude independently of the data loss.
+            tv_damping = torch.exp(-_tv_per_sample(x0_models) / c).view(-1, 1, 1, 1)
             latents = latents - current_rho * change_rate * latents_grad * tv_damping
             latents = latents.detach()
             
-        if save_x0_steps:
-            x0_predictions.append(x0_pred.detach().cpu().numpy())
-        
         if x_true is not None:
             with torch.no_grad():
                 latent_models = _crop_model_batch(latents)
@@ -602,22 +428,8 @@ def sample(scheduler, unet, npy_size, batch_size=1, rho=0, rate_down=1, rate_pow
                 current_rho=current_rho if rho > 0 else 0,
             )
             
-    if save_x0_steps:
-        return latents, x0_predictions, error_history, error_0_history, loss_history
-    return latents, None, error_history, error_0_history, loss_history
+    return latents, error_history, error_0_history, loss_history
 
-def plot_npy(latents, path, rows=4, cols=4, rho=0, grad_decay=1.0):
-    os.makedirs(path, exist_ok=True)
-    fig, axes = plt.subplots(rows, cols, figsize=(16, 16))
-    if rows == 1 and cols == 1:
-        axes = np.array([[axes]])
-    for i in range(rows * cols):
-        ax = axes[i // cols, i % cols]
-        im = ax.imshow(latents[i, 0].detach().cpu().numpy())
-        ax.axis("off")
-        fig.colorbar(im, ax=ax)
-    plt.tight_layout()
-    plt.savefig(os.path.join(path, f"sample_rho_{rho}_{grad_decay}.png"), dpi=300, bbox_inches="tight", pad_inches=0.1)
 
 def plot_real_and_pred(x_true, x_pred, path, rho=0, grad_decay=1.0):
     os.makedirs(path, exist_ok=True)
@@ -656,41 +468,6 @@ def plot_real_and_pred(x_true, x_pred, path, rho=0, grad_decay=1.0):
     plt.savefig(os.path.join(path, f"real_and_pred_rho_{rho}_{grad_decay}.png"), dpi=300, bbox_inches="tight", pad_inches=0.1)
     plt.close()
     
-def plot_npy_steps(x0_predictions, path, rows=4, cols=4, rho=0, grad_decay=1.0):
-    os.makedirs(path, exist_ok=True)
-    num_steps = len(x0_predictions)
-    if num_steps > rows * cols:
-        jump = (num_steps // (rows * cols)) + 1
-        x0_predictions = [x0_predictions[i] for i in range(0, num_steps, jump)]
-    num_steps = len(x0_predictions)
-    if len(x0_predictions[0].shape)==2:
-        fig, axes = plt.subplots(rows, cols, figsize=(20, 20))
-        for step in range(num_steps):
-            ax = axes[step // cols, step % cols]
-            im = ax.imshow(x0_predictions[step])
-            ax.axis("off")
-            fig.colorbar(im, ax=ax)
-        for step in range(num_steps, rows * cols):
-            ax = axes[step // cols, step % cols]
-            ax.axis("off")
-        plt.tight_layout()
-        plt.savefig(os.path.join(path, f"x0_step_{step}_rho_{rho}_{grad_decay}.png"), dpi=300, bbox_inches="tight", pad_inches=0.1)
-        plt.close()
-    else:
-        for batch_idx in range(len(x0_predictions[0])):
-            fig, axes = plt.subplots(rows, cols, figsize=(20, 20))
-            for step in range(num_steps):
-                ax = axes[step // cols, step % cols]
-                im = ax.imshow(np.squeeze(x0_predictions[step][batch_idx]))
-                ax.axis("off")
-                fig.colorbar(im, ax=ax)
-            for step in range(num_steps, rows * cols):
-                ax = axes[step // cols, step % cols]
-                ax.axis("off")
-            plt.tight_layout()
-            plt.savefig(os.path.join(path, f"batch_{batch_idx}_x0_step_{step}_rho_{rho}_{grad_decay}.png"), dpi=300, bbox_inches="tight", pad_inches=0.1)
-            plt.close()
-
 def plot_errors(error_history, error_0_history, path, rho=0, grad_decay=1.0):
     os.makedirs(path, exist_ok=True)
     plt.figure(figsize=(10, 6))
@@ -721,207 +498,6 @@ def plot_loss(loss_history, path, rho=0, grad_decay=1.0):
     plt.savefig(os.path.join(path, f"loss_rho_{rho}_{grad_decay}.png"), dpi=300, bbox_inches="tight")
     plt.close()
 
-def save_results_to_file(error, error_0, loss, loss_type, rho, grad_decay, lam_range, lam_tv, warmup_steps, weight_power, rms_threshold, agc_window_size, filename="result.txt"):
-    """
-    将error、error_0和loss的最终值保存到文件中（追加模式）
-    包含优化算法、误差计算方法和相应参数的信息
-    """
-    with open(filename, "a") as f:
-        f.write(f"误差计算方法: {loss_type}\n")
-        f.write(f"梯度下降步长(rho): {rho}\n")
-        f.write(f"梯度衰减参数(grad_decay): {grad_decay}\n")
-        f.write(f"Warm-up步数: {warmup_steps}\n")
-        f.write(f"权重参数: lam_range={lam_range}, lam_tv={lam_tv}\n")
-        f.write(f"权重幂次(weight_power): {weight_power}\n")
-        f.write(f"RMS阈值(rms_threshold): {rms_threshold}\n")
-        f.write(f"AGC窗口大小(agc_window_size): {agc_window_size}\n")
-        f.write(f"最终Error: {error}\n")
-        f.write(f"最终Error_0: {error_0}\n")
-        f.write(f"最终Loss: {loss}\n")
-        f.write("-" * 50 + "\n")
-
-
-def save_sorted_summary(results, filename):
-    """将所有已完成实验按最终 Error 从小到大写入一个汇总文件。"""
-    os.makedirs(os.path.dirname(filename), exist_ok=True)
-    sorted_results = sorted(results, key=lambda item: item["error"])
-
-    with open(filename, "w") as f:
-        f.write(f"实验结果汇总（按最终 Error 从小到大排序，共 {len(sorted_results)} 组）\n")
-        f.write("=" * 100 + "\n")
-        for rank, result in enumerate(sorted_results, start=1):
-            f.write(f"排名: {rank}\n")
-            f.write(f"测试样本(ex_num): {result['ex_num']}\n")
-            f.write(f"随机种子(seed): {result['seed']}\n")
-            f.write(f"误差计算方法: {result['loss_type']}\n")
-            f.write(f"炮数(shot_num): {result['shot_num']}\n")
-            f.write(f"炮点/接收点位置: {result['source_locations']}/{result['receiver_locations']}\n")
-            f.write(f"梯度下降步长(rho): {result['rho']}\n")
-            f.write(f"梯度衰减参数(grad_decay): {result['grad_decay']}\n")
-            f.write(f"Warm-up步数: {result['warmup_steps']}\n")
-            f.write(f"rate_down: {result['rate_down']}\n")
-            f.write(f"rate_power: {result['rate_power']}\n")
-            f.write(f"lam_range: {result['lam_range']}\n")
-            f.write(f"lam_tv: {result['lam_tv']}\n")
-            f.write(f"权重参数(k): {result['k']}\n")
-            f.write(f"RMS阈值: {result['rms_threshold']}\n")
-            f.write(f"AGC窗口大小: {result['agc_window_size']}\n")
-            f.write(f"最终Error: {result['error']}\n")
-            f.write(f"最终Error_0: {result['error_0']}\n")
-            f.write(f"最终Loss: {result['loss']}\n")
-            f.write(f"结果目录: {result['target_path']}\n")
-            f.write("-" * 100 + "\n")
-
-
-
-def plot_wavefield_comparison(wave_true, wave_pred, path, filename_prefix, rho=0, grad_decay=1.0):
-    os.makedirs(path, exist_ok=True)
-    n_shots = wave_true.shape[0]
-    
-    fig, axes = plt.subplots(3, n_shots, figsize=(15, 9))
-    if n_shots == 1:
-        axes = axes.reshape(3, 1)
-
-    # 统一颜色条范围
-    vmax = max(torch.max(torch.abs(wave_true)).item(), torch.max(torch.abs(wave_pred)).item())
-    vmin = -vmax
-    diff_vmax = torch.max(torch.abs(wave_true - wave_pred)).item()
-    diff_vmin = -diff_vmax
-
-    # 标题
-    row_titles = ["Predicted", "True", "Difference"]
-
-    for i in range(n_shots):
-        # Predicted
-        im1 = axes[0, i].imshow(wave_pred[i].cpu().detach().numpy().T, cmap='seismic', aspect='auto', vmin=vmin, vmax=vmax)
-        fig.colorbar(im1, ax=axes[0, i])
-        axes[0, i].set_title(f"Shot {i+1}")
-        if i == 0:
-            axes[0, i].set_ylabel(row_titles[0])
-
-        # True
-        im2 = axes[1, i].imshow(wave_true[i].cpu().detach().numpy().T, cmap='seismic', aspect='auto', vmin=vmin, vmax=vmax)
-        fig.colorbar(im2, ax=axes[1, i])
-        if i == 0:
-            axes[1, i].set_ylabel(row_titles[1])
-
-        # Difference
-        im3 = axes[2, i].imshow((wave_true - wave_pred)[i].cpu().detach().numpy().T, cmap='seismic', aspect='auto', vmin=diff_vmin, vmax=diff_vmax)
-        fig.colorbar(im3, ax=axes[2, i])
-        if i == 0:
-            axes[2, i].set_ylabel(row_titles[2])
-
-    plt.tight_layout()
-    plt.savefig(os.path.join(path, f"{filename_prefix}_rho_{rho}_{grad_decay}.png"), dpi=300, bbox_inches="tight", pad_inches=0.1)
-    plt.close()
-
-def plot_receiver_waveforms(wave_true, wave_pred, path, filename_prefix, receiver_idx=0, rho=0, grad_decay=1.0):
-    """
-    绘制指定receiver接收到的所有shot的一维波形图
-    将真实值和预测值画到同一个图中，不画差值
-    
-    Args:
-        wave_true: 真实波场数据，形状为 (n_shots, n_receivers, n_timesteps)
-        wave_pred: 预测波场数据，形状为 (n_shots, n_receivers, n_timesteps)
-        path: 保存路径
-        filename_prefix: 文件名前缀
-        receiver_idx: 要绘制的receiver索引，默认为0（第一个receiver）
-        rho: 优化参数
-        grad_decay: 梯度衰减参数
-    """
-    os.makedirs(path, exist_ok=True)
-    n_shots = wave_true.shape[0]
-    n_timesteps = wave_true.shape[2]
-    
-    # 创建子图，每个shot一个子图
-    fig, axes = plt.subplots(n_shots, 1, figsize=(12, 3 * n_shots))
-    if n_shots == 1:
-        axes = [axes]  # 如果只有一个shot，确保axes是列表形式
-    
-    # 时间轴
-    time_axis = np.linspace(0, n_timesteps * PHYSICS["dt"], n_timesteps)
-    
-    # 统一y轴范围
-    y_max = max(torch.max(torch.abs(wave_true[:, receiver_idx, :])).item(),
-                torch.max(torch.abs(wave_pred[:, receiver_idx, :])).item())
-    
-    for i in range(n_shots):
-        ax = axes[i]
-        
-        # 提取当前shot和指定receiver的数据
-        true_data = wave_true[i, receiver_idx, :].cpu().detach().numpy()
-        pred_data = wave_pred[i, receiver_idx, :].cpu().detach().numpy()
-        
-        # 绘制波形
-        ax.plot(time_axis, true_data, 'b-', label='True', linewidth=1.5)
-        ax.plot(time_axis, pred_data, 'r--', label='Predicted', linewidth=1.5)
-        
-        # 设置图标题和标签
-        ax.set_title(f"Shot {i+1}, Receiver {receiver_idx+1}")
-        ax.set_xlabel("Time (s)")
-        ax.set_ylabel("Amplitude")
-        ax.legend()
-        ax.grid(True, alpha=0.3)
-        
-        # 设置统一的y轴范围
-        ax.set_ylim(-y_max * 1.1, y_max * 1.1)
-    
-    plt.tight_layout()
-    plt.savefig(os.path.join(path, f"{filename_prefix}_receiver_{receiver_idx+1}_rho_{rho}_{grad_decay}.png"),
-                dpi=300, bbox_inches="tight", pad_inches=0.1)
-    plt.close()
-
-def plot_receiver_weights(weights, path, filename_prefix, receiver_idx=0, rho=0, grad_decay=1.0):
-    """
-    绘制指定receiver接收到的所有shot的weights图
-    将weights以一维折线图形式展示
-    
-    Args:
-        weights: 权重数据，形状为 (n_shots, n_receivers, n_timesteps)
-        path: 保存路径
-        filename_prefix: 文件名前缀
-        receiver_idx: 要绘制的receiver索引，默认为0（第一个receiver）
-        rho: 优化参数
-        grad_decay: 梯度衰减参数
-    """
-    os.makedirs(path, exist_ok=True)
-    n_shots = weights.shape[0]
-    n_timesteps = weights.shape[2]
-    
-    # 创建子图，每个shot一个子图
-    fig, axes = plt.subplots(n_shots, 1, figsize=(12, 3 * n_shots))
-    if n_shots == 1:
-        axes = [axes]  # 如果只有一个shot，确保axes是列表形式
-    
-    # 时间轴
-    time_axis = np.linspace(0, n_timesteps * PHYSICS["dt"], n_timesteps)
-    
-    # 统一y轴范围
-    y_min = torch.min(weights).item()
-    y_max = torch.max(weights).item()
-    
-    for i in range(n_shots):
-        ax = axes[i]
-        
-        # 提取当前shot和指定receiver的weights数据
-        weights_data = weights[i, receiver_idx, :].cpu().detach().numpy()
-        
-        # 绘制weights为一维折线图
-        ax.plot(time_axis, weights_data, 'g-', linewidth=1.5)
-        
-        # 设置图标题和标签
-        ax.set_title(f"Shot {i+1}, Receiver {receiver_idx+1} Weights")
-        ax.set_xlabel("Time (s)")
-        ax.set_ylabel("Weight Value")
-        ax.grid(True, alpha=0.3)
-        
-        # 设置统一的y轴范围
-        ax.set_ylim(y_min * 0.9, y_max * 1.1)
-    
-    plt.tight_layout()
-    plt.savefig(os.path.join(path, f"{filename_prefix}_receiver_{receiver_idx+1}_weights_rho_{rho}_{grad_decay}.png"),
-                dpi=300, bbox_inches="tight", pad_inches=0.1)
-    plt.close()
 
 def save_latents_pt(x, path, rho, grad_decay):
     if not os.path.exists(path):

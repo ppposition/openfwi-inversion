@@ -47,6 +47,11 @@ def run(config: dict) -> None:
     seed = int(runtime.get("seed", 0))
     model_path = resolve_path(config, require(dataset, "model_path", "datasets.<selected>"))
     sample_specs = _sample_specs(dataset)
+    sample_seeds = (
+        [int(item.get("seed", seed)) for item in sample_specs]
+        if any("seed" in item for item in sample_specs)
+        else None
+    )
     output_dir = resolve_path(config, runtime.get("output_dir", "outputs")) / config["dataset"] / "diffusion"
     output_dir.mkdir(parents=True, exist_ok=True)
     snapshot_config(config, output_dir)
@@ -77,7 +82,7 @@ def run(config: dict) -> None:
     if tuple(x_true.shape[1:]) != expected_shape:
         raise ValueError(f"Expected sample shape {expected_shape}, got {tuple(x_true.shape[1:])}")
 
-    latents, x0_steps, errors, x0_errors, losses = core.sample(
+    latents, errors, x0_errors, losses = core.sample(
         scheduler,
         unet,
         int(section["image_size"]),
@@ -85,21 +90,16 @@ def run(config: dict) -> None:
         rho=float(section["rho"]),
         rate_down=float(section["rate_down"]),
         rate_power=float(section["rate_power"]),
-        save_x0_steps=bool(section.get("plot_x0_steps", False)),
         x_true=x_true,
         loss_type=section["loss"],
         grad_decay=float(section["grad_decay"]),
-        lam_range=float(section["lambda_range"]),
-        lam_tv=float(section["lambda_tv"]),
         shot_num=int(acquisition["shots"]),
         source_locations=acquisition["source_side"],
         receiver_locations=acquisition["receiver_side"],
-        warmup_steps=int(section["warmup_steps"]),
         k=float(section["weight_k"]),
-        rms_threshold=float(section["rms_threshold"]),
-        agc_window_size=int(section["agc_window_size"]),
         seed=seed,
         noise_std=float(section["observation_noise_std"]),
+        sample_seeds=sample_seeds,
     )
     prediction = latents[:, 0, 1:-1, 1:-1]
     data_dir = output_dir / "data"
@@ -139,18 +139,17 @@ def run(config: dict) -> None:
                 "name": name,
                 "sample_file": str(path),
                 "sample_index": item.get("index"),
+                "seed": sample_seeds[index] if sample_seeds is not None else None,
                 "final_error": sample_errors[-1],
                 "final_x0_error": sample_x0_errors[-1],
                 "final_loss": sample_losses[-1],
             }
         )
-    if section.get("plot_x0_steps", False):
-        core.plot_npy_steps(x0_steps, output_dir / "x0_steps", rows=8, cols=8, rho=section["rho"], grad_decay=section["grad_decay"])
-
     metrics = {
         "dataset": config["dataset"],
         "batch_size": len(sample_specs),
         "seed": seed,
+        "sample_seeds": sample_seeds,
         "mean_final_error": mean_errors[-1],
         "mean_final_x0_error": mean_x0_errors[-1],
         "mean_final_loss": mean_losses[-1],
